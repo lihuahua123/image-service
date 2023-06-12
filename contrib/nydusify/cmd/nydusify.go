@@ -21,6 +21,7 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/checker"
+	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/checker/rule"
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/converter"
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/packer"
 	"github.com/dragonflyoss/image-service/contrib/nydusify/pkg/provider"
@@ -29,6 +30,7 @@ import (
 
 	"encoding/base64"
 	"encoding/json"
+
 	dockerconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/distribution/reference"
 )
@@ -174,14 +176,6 @@ func getPrefetchPatterns(c *cli.Context) (string, error) {
 	}
 
 	return patterns, nil
-}
-
-type RegistryBackendConfig struct {
-	Scheme     string `json:"scheme"`
-	Host       string `json:"host"`
-	Repo       string `json:"repo"`
-	Auth       string `json:"auth,omitempty"`
-	SkipVerify bool   `json:"skip_verify,omitempty"`
 }
 
 func main() {
@@ -713,8 +707,6 @@ func main() {
 				if err != nil {
 					return err
 				} else if backendConfig == "" {
-					// TODO get auth from docker configuration file
-					// parsed, err := reference.ParseNormalizedNamed(rule.Target)
 
 					backendType = "registry"
 					parsed, err := reference.ParseNormalizedNamed(c.String("target"))
@@ -741,18 +733,14 @@ func main() {
 						skipVerify = true
 					}
 					scheme := "http"
-					// if rule.PlainHTTP {
-					// 	scheme = "http"
-					// }
 
-					backendConfig_struct := RegistryBackendConfig{scheme, host, repo, auth, skipVerify}
-					bytes, err := json.Marshal(backendConfig_struct)
+					backendConfigStruct := rule.RegistryBackendConfig{scheme, host, repo, auth, skipVerify}
+					bytes, err := json.Marshal(backendConfigStruct)
 					if err != nil {
 						return errors.Wrap(err, "parse registry backend config")
 					}
 					backendConfig = string(bytes)
 
-					//return errors.Errorf("backend configuration is empty, please specify option '--backend-config'")
 				}
 
 				_, arch, err := provider.ExtractOsArch(c.String("platform"))
