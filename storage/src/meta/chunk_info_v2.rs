@@ -197,17 +197,18 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         if self.compressed_end() > state.compressed_size
             || self.uncompressed_end() > state.uncompressed_size
             || self.uncompressed_size() == 0
-            || (!state.is_separate() && self.compressed_size() == 0)
+            || (!state.is_separate() && !self.is_batch() && self.compressed_size() == 0)
             || (!self.is_compressed() && self.uncompressed_size() != self.compressed_size())
         {
             return Err(einval!(format!(
-                "invalid chunk, blob: index {}/c_end 0x{:}/d_end 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {} zran {}",
+                "invalid chunk, blob: index {}/c_size 0x{:}/d_size 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {} batch {} zran {}",
                 state.blob_index,
                 state.compressed_size,
                 state.uncompressed_size,
                 self.compressed_end(),
                 self.uncompressed_end(),
                 self.is_compressed(),
+                self.is_batch(),
                 self.is_zran(),
             )));
         }
@@ -264,8 +265,6 @@ impl Display for BlobChunkInfoV2Ondisk {
 mod tests {
     use super::*;
     use crate::meta::BlobMetaChunkArray;
-    use nydus_utils::digest::RafsDigest;
-    use nydus_utils::filemap::FileMapState;
     use std::mem::ManuallyDrop;
 
     #[test]
@@ -323,10 +322,6 @@ mod tests {
     #[test]
     fn test_get_chunk_index_with_hole() {
         let state = BlobCompressionContext {
-            blob_index: 0,
-            blob_features: 0,
-            compressed_size: 0,
-            uncompressed_size: 0,
             chunk_info_array: ManuallyDrop::new(BlobMetaChunkArray::V2(vec![
                 BlobChunkInfoV2Ondisk {
                     uncomp_info: u64::to_le(0x0100_1fff_0000_0000),
@@ -339,53 +334,48 @@ mod tests {
                     data: 0,
                 },
             ])),
-            chunk_digest_array: Default::default(),
-            zran_info_array: Default::default(),
-            zran_dict_table: Default::default(),
-            blob_meta_file_map: FileMapState::default(),
-            chunk_digest_file_map: FileMapState::default(),
-            chunk_digest_default: RafsDigest::default(),
+            ..Default::default()
         };
 
         assert_eq!(
             state
                 .chunk_info_array
-                .get_chunk_index_nocheck(0, false)
+                .get_chunk_index_nocheck(&state, 0, false)
                 .unwrap(),
             0
         );
         assert_eq!(
             state
                 .chunk_info_array
-                .get_chunk_index_nocheck(0x1fff, false)
+                .get_chunk_index_nocheck(&state, 0x1fff, false)
                 .unwrap(),
             0
         );
         assert_eq!(
             state
                 .chunk_info_array
-                .get_chunk_index_nocheck(0x100000, false)
+                .get_chunk_index_nocheck(&state, 0x100000, false)
                 .unwrap(),
             1
         );
         assert_eq!(
             state
                 .chunk_info_array
-                .get_chunk_index_nocheck(0x101fff, false)
+                .get_chunk_index_nocheck(&state, 0x101fff, false)
                 .unwrap(),
             1
         );
         state
             .chunk_info_array
-            .get_chunk_index_nocheck(0x2000, false)
+            .get_chunk_index_nocheck(&state, 0x2000, false)
             .unwrap_err();
         state
             .chunk_info_array
-            .get_chunk_index_nocheck(0xfffff, false)
+            .get_chunk_index_nocheck(&state, 0xfffff, false)
             .unwrap_err();
         state
             .chunk_info_array
-            .get_chunk_index_nocheck(0x102000, false)
+            .get_chunk_index_nocheck(&state, 0x102000, false)
             .unwrap_err();
     }
 }

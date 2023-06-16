@@ -446,22 +446,36 @@ impl BlobCompressionContextInfo {
             compressed_size: blob_info.compressed_data_size(),
             uncompressed_size: round_up_4k(blob_info.uncompressed_size()),
             chunk_info_array: chunk_infos,
-            chunk_digest_array: Default::default(),
-            zran_info_array: Default::default(),
-            zran_dict_table: Default::default(),
             blob_meta_file_map: filemap,
-            chunk_digest_file_map: FileMapState::default(),
-            chunk_digest_default: RafsDigest::default(),
+            ..Default::default()
         };
 
-        if blob_info.has_feature(BlobFeatures::ZRAN) {
+        if blob_info.has_feature(BlobFeatures::BATCH) {
+            let header = state
+                .blob_meta_file_map
+                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size as usize)?;
+            let inflate_offset = header.s_ci_zran_offset as usize;
+            let inflate_count = header.s_ci_zran_count as usize;
+            let batch_inflate_size = inflate_count * size_of::<BatchInflateContext>();
+            let ptr = state
+                .blob_meta_file_map
+                .validate_range(inflate_offset, batch_inflate_size)?;
+            let array = unsafe {
+                Vec::from_raw_parts(
+                    ptr as *mut u8 as *mut BatchInflateContext,
+                    inflate_count,
+                    inflate_count,
+                )
+            };
+            state.batch_info_array = ManuallyDrop::new(array);
+        } else if blob_info.has_feature(BlobFeatures::ZRAN) {
             let header = state
                 .blob_meta_file_map
                 .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size as usize)?;
             let zran_offset = header.s_ci_zran_offset as usize;
             let zran_count = header.s_ci_zran_count as usize;
             let ci_zran_size = header.s_ci_zran_size as usize;
-            let zran_size = header.s_ci_zran_count as usize * size_of::<ZranInflateContext>();
+            let zran_size = zran_count * size_of::<ZranInflateContext>();
             let ptr = state
                 .blob_meta_file_map
                 .validate_range(zran_offset, zran_size)?;
@@ -656,6 +670,36 @@ impl BlobCompressionContextInfo {
         BlobMetaChunk::new(chunk_index, &self.state)
     }
 
+    /// Get whether chunk at `chunk_index` is batch chunk.
+    /// Some chunks build in batch mode can also be non-batch chunks,
+    /// that they are too big to be put into a batch.
+    pub fn is_batch_chunk(&self, chunk_index: u32) -> bool {
+        self.state.is_batch_chunk(chunk_index as usize)
+    }
+
+    /// Get Batch index associated with the chunk at `chunk_index`.
+    pub fn get_batch_index(&self, chunk_index: u32) -> u32 {
+        self.state.get_batch_index(chunk_index as usize)
+    }
+
+    /// Get uncompressed batch offset associated with the chunk at `chunk_index`.
+    pub fn get_uncompressed_offset_in_batch_buf(&self, chunk_index: u32) -> u32 {
+        self.state
+            .get_uncompressed_offset_in_batch_buf(chunk_index as usize)
+    }
+
+    /// Get Batch context information at `batch_index`.
+    pub fn get_batch_context(&self, batch_index: u32) -> Option<&BatchInflateContext> {
+        self.state.get_batch_context(batch_index as usize)
+    }
+
+    /// Get compressed offset and size associated with the chunk at `chunk_index`.
+    /// Capabale of handling both batch and non-batch chunks.
+    /// Return `compressed_offset` and `compressed_size`.
+    pub fn get_compressed_info(&self, chunk_index: u32) -> Result<(u64, u32)> {
+        self.state.get_compressed_info(chunk_index as usize)
+    }
+
     /// Get ZRan index associated with the chunk at `chunk_index`.
     pub fn get_zran_index(&self, chunk_index: u32) -> u32 {
         self.state.get_zran_index(chunk_index as usize)
@@ -792,7 +836,8 @@ impl BlobCompressionContextInfo {
         let info_size = u64::from_le(header.s_ci_uncompressed_size) as usize;
         let aligned_info_size = round_up_4k(info_size);
         if blob_info.has_feature(BlobFeatures::CHUNK_INFO_V2)
-            && blob_info.has_feature(BlobFeatures::ZRAN)
+            && (blob_info.has_feature(BlobFeatures::ZRAN)
+                || blob_info.has_feature(BlobFeatures::BATCH))
         {
             if info_size < (chunk_count as usize) * (size_of::<BlobChunkInfoV2Ondisk>()) {
                 return Err(einval!("uncompressed size in blob meta header is invalid!"));
@@ -803,7 +848,9 @@ impl BlobCompressionContextInfo {
             {
                 return Err(einval!("uncompressed size in blob meta header is invalid!"));
             }
-        } else if blob_info.has_feature(BlobFeatures::ZRAN) {
+        } else if blob_info.has_feature(BlobFeatures::ZRAN)
+            || blob_info.has_feature(BlobFeatures::BATCH)
+        {
             return Err(einval!("invalid feature flags in blob meta header!"));
         } else if info_size != (chunk_count as usize) * (size_of::<BlobChunkInfoV1Ondisk>())
             || (aligned_info_size as u64) > BLOB_CCT_V1_MAX_SIZE
@@ -834,6 +881,7 @@ impl BlobCompressionContextInfo {
 }
 
 /// Struct to maintain compression context information for all chunks in a blob.
+#[derive(Default)]
 pub struct BlobCompressionContext {
     pub(crate) blob_index: u32,
     pub(crate) blob_features: u32,
@@ -841,6 +889,7 @@ pub struct BlobCompressionContext {
     pub(crate) uncompressed_size: u64,
     pub(crate) chunk_info_array: ManuallyDrop<BlobMetaChunkArray>,
     pub(crate) chunk_digest_array: ManuallyDrop<Vec<DigestData>>,
+    pub(crate) batch_info_array: ManuallyDrop<Vec<BatchInflateContext>>,
     pub(crate) zran_info_array: ManuallyDrop<Vec<ZranInflateContext>>,
     pub(crate) zran_dict_table: ManuallyDrop<Vec<u8>>,
     blob_meta_file_map: FileMapState,
@@ -894,7 +943,51 @@ impl BlobCompressionContext {
     }
 
     fn get_chunk_index(&self, addr: u64) -> Result<usize> {
-        self.chunk_info_array.get_chunk_index_nocheck(addr, false)
+        self.chunk_info_array
+            .get_chunk_index_nocheck(self, addr, false)
+    }
+
+    /// Get whether chunk at `chunk_index` is batch chunk.
+    /// Some chunks build in batch mode can also be non-batch chunks,
+    /// that they are too big to be put into a batch.
+    fn is_batch_chunk(&self, chunk_index: usize) -> bool {
+        self.chunk_info_array.is_batch(chunk_index)
+    }
+
+    fn get_batch_index(&self, chunk_index: usize) -> u32 {
+        self.chunk_info_array.batch_index(chunk_index)
+    }
+
+    fn get_uncompressed_offset_in_batch_buf(&self, chunk_index: usize) -> u32 {
+        self.chunk_info_array
+            .uncompressed_offset_in_batch_buf(chunk_index)
+    }
+
+    /// Get Batch context information for decoding.
+    fn get_batch_context(&self, batch_index: usize) -> Option<&BatchInflateContext> {
+        if batch_index < self.batch_info_array.len() {
+            let ctx = &self.batch_info_array[batch_index];
+            Some(ctx)
+        } else {
+            None
+        }
+    }
+
+    /// Get compressed offset and size associated with the chunk at `chunk_index`.
+    /// Capabale of handling both batch and non-batch chunks.
+    /// Return `compressed_offset` and `compressed_size`.
+    pub fn get_compressed_info(&self, chunk_index: usize) -> Result<(u64, u32)> {
+        if self.is_batch_chunk(chunk_index) {
+            let ctx = self
+                .get_batch_context(self.get_batch_index(chunk_index) as usize)
+                .unwrap();
+            Ok((ctx.compressed_offset(), ctx.compressed_size()))
+        } else {
+            Ok((
+                self.chunk_info_array.compressed_offset(chunk_index),
+                self.chunk_info_array.compressed_size(chunk_index),
+            ))
+        }
     }
 
     fn get_zran_index(&self, chunk_index: usize) -> u32 {
@@ -935,6 +1028,12 @@ pub enum BlobMetaChunkArray {
     V1(Vec<BlobChunkInfoV1Ondisk>),
     /// V2 chunk compression information array.
     V2(Vec<BlobChunkInfoV2Ondisk>),
+}
+
+impl Default for BlobMetaChunkArray {
+    fn default() -> Self {
+        BlobMetaChunkArray::new_v2()
+    }
 }
 
 // Methods for RAFS filesystem builder.
@@ -1069,10 +1168,19 @@ impl BlobMetaChunkArray {
         }
     }
 
-    fn get_chunk_index_nocheck(&self, addr: u64, compressed: bool) -> Result<usize> {
+    fn get_chunk_index_nocheck(
+        &self,
+        state: &BlobCompressionContext,
+        addr: u64,
+        compressed: bool,
+    ) -> Result<usize> {
         match self {
-            BlobMetaChunkArray::V1(v) => Self::_get_chunk_index_nocheck(v, addr, compressed, false),
-            BlobMetaChunkArray::V2(v) => Self::_get_chunk_index_nocheck(v, addr, compressed, false),
+            BlobMetaChunkArray::V1(v) => {
+                Self::_get_chunk_index_nocheck(state, v, addr, compressed, false)
+            }
+            BlobMetaChunkArray::V2(v) => {
+                Self::_get_chunk_index_nocheck(state, v, addr, compressed, false)
+            }
         }
     }
 
@@ -1153,6 +1261,27 @@ impl BlobMetaChunkArray {
         }
     }
 
+    fn is_batch(&self, index: usize) -> bool {
+        match self {
+            BlobMetaChunkArray::V1(v) => v[index].is_batch(),
+            BlobMetaChunkArray::V2(v) => v[index].is_batch(),
+        }
+    }
+
+    fn batch_index(&self, index: usize) -> u32 {
+        match self {
+            BlobMetaChunkArray::V1(v) => v[index].get_batch_index(),
+            BlobMetaChunkArray::V2(v) => v[index].get_batch_index(),
+        }
+    }
+
+    fn uncompressed_offset_in_batch_buf(&self, index: usize) -> u32 {
+        match self {
+            BlobMetaChunkArray::V1(v) => v[index].get_uncompressed_offset_in_batch_buf(),
+            BlobMetaChunkArray::V2(v) => v[index].get_uncompressed_offset_in_batch_buf(),
+        }
+    }
+
     fn zran_index(&self, index: usize) -> u32 {
         match self {
             BlobMetaChunkArray::V1(v) => v[index].get_zran_index(),
@@ -1182,6 +1311,7 @@ impl BlobMetaChunkArray {
     }
 
     fn _get_chunk_index_nocheck<T: BlobMetaChunkInfo>(
+        state: &BlobCompressionContext,
         chunks: &[T],
         addr: u64,
         compressed: bool,
@@ -1200,8 +1330,9 @@ impl BlobMetaChunkArray {
             // - `mid < size`: `mid` is limited by `[left; right)` bound.
             let entry = &chunks[mid];
             if compressed {
-                start = entry.compressed_offset();
-                end = entry.compressed_end();
+                // Capabale of handling both batch and non-batch chunks.
+                let (c_offset, c_size) = state.get_compressed_info(mid)?;
+                (start, end) = (c_offset, c_offset + c_size as u64);
             } else {
                 start = entry.uncompressed_offset();
                 end = entry.uncompressed_end();
@@ -1212,7 +1343,12 @@ impl BlobMetaChunkArray {
             } else if end <= addr {
                 left = mid + 1;
             } else {
-                return Ok(mid);
+                // Find the first chunk in the batch.
+                if entry.is_batch() && entry.get_uncompressed_offset_in_batch_buf() > 0 {
+                    right = mid;
+                } else {
+                    return Ok(mid);
+                }
             }
 
             size = right - left;
@@ -1250,7 +1386,8 @@ impl BlobMetaChunkArray {
         batch_size: u64,
     ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
         let mut vec = Vec::with_capacity(512);
-        let mut index = Self::_get_chunk_index_nocheck(chunk_info_array, start, false, false)?;
+        let mut index =
+            Self::_get_chunk_index_nocheck(state, chunk_info_array, start, false, false)?;
         let entry = Self::get_chunk_entry(state, chunk_info_array, index)?;
         trace!(
             "get_chunks_uncompressed: entry {} {}",
@@ -1367,7 +1504,8 @@ impl BlobMetaChunkArray {
         prefetch: bool,
     ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
         let mut vec = Vec::with_capacity(512);
-        let mut index = Self::_get_chunk_index_nocheck(chunk_info_array, start, true, prefetch)?;
+        let mut index =
+            Self::_get_chunk_index_nocheck(state, chunk_info_array, start, true, prefetch)?;
         let entry = Self::get_chunk_entry(state, chunk_info_array, index)?;
 
         // Special handling of ZRan chunks
@@ -1468,6 +1606,7 @@ impl BlobMetaChunkArray {
         chunks: &[Arc<dyn BlobChunkInfo>],
         max_size: u64,
     ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+        // `batch_end` is only valid for non-batch chunk.
         let batch_end = chunks[0].compressed_offset() + max_size;
         let first_idx = chunks[0].id() as usize;
         let first_entry = Self::get_chunk_entry(state, chunk_info_array, first_idx)?;
@@ -1476,7 +1615,7 @@ impl BlobMetaChunkArray {
         let mut vec = Vec::with_capacity(128);
 
         // Special handling of ZRan chunks
-        if last_entry.is_zran() {
+        if first_entry.is_zran() {
             let first_zran_idx = first_entry.get_zran_index();
             let mut last_zran_idx = last_entry.get_zran_index();
             let mut index = first_idx;
@@ -1510,7 +1649,46 @@ impl BlobMetaChunkArray {
                 }
                 index += 1;
             }
+        } else if first_entry.is_batch() {
+            // Assert each entry in chunks is Batch chunk.
+
+            let first_batch_idx = first_entry.get_batch_index();
+            let last_batch_idx = last_entry.get_batch_index();
+            let mut index = first_idx;
+            if first_batch_idx != last_batch_idx {
+                return Err(einval!(
+                    "a single region cannot include multiple batch chunks"
+                ));
+            }
+
+            while index > 0 {
+                let entry = Self::get_chunk_entry(state, chunk_info_array, index - 1)?;
+                if !entry.is_batch() || entry.get_batch_index() != first_batch_idx {
+                    // Reach the previous non-batch chunk,
+                    // or reach the header chunk associated with the same Batch context.
+                    break;
+                } else {
+                    index -= 1;
+                }
+            }
+
+            for entry in &chunk_info_array[index..] {
+                if entry.validate(state).is_err() {
+                    return Err(einval!("invalid Batch compression information data"));
+                } else if !entry.is_batch() {
+                    return Err(einval!(
+                        "non-batch chunks cannot be inside the range of batch chunks"
+                    ));
+                } else if entry.get_batch_index() > last_batch_idx {
+                    return Ok(vec);
+                } else {
+                    vec.push(BlobMetaChunk::new(index, state));
+                }
+                index += 1;
+            }
         } else {
+            // Assert each entry in chunks is not Batch chunk.
+
             for idx in 0..chunks.len() - 1 {
                 let chunk = &chunks[idx];
                 let next = &chunks[idx + 1];
@@ -1534,7 +1712,9 @@ impl BlobMetaChunkArray {
                 if entry.validate(state).is_err() || entry.compressed_end() > batch_end {
                     break;
                 }
-                vec.push(BlobMetaChunk::new(last_idx, state));
+                if !entry.is_batch() {
+                    vec.push(BlobMetaChunk::new(last_idx, state));
+                }
                 last_idx += 1;
             }
         }

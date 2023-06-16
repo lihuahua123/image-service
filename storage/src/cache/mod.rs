@@ -183,6 +183,11 @@ pub trait BlobCache: Send + Sync {
         false
     }
 
+    /// Check whether the blob is Batch based.
+    fn is_batch(&self) -> bool {
+        false
+    }
+
     /// Check whether need to validate the data chunk by digest value.
     fn need_validation(&self) -> bool;
 
@@ -288,7 +293,7 @@ pub trait BlobCache: Send + Sync {
         let offset = chunk.compressed_offset();
         let mut c_buf = None;
 
-        if self.is_zran() {
+        if self.is_zran() || self.is_batch() {
             return Err(enosys!("read_chunk_from_backend"));
         } else if chunk.is_compressed() {
             let c_size = if self.is_legacy_stargz() {
@@ -344,7 +349,12 @@ pub trait BlobCache: Send + Sync {
                 e
             })?;
             if ret != buffer.len() {
-                return Err(eother!("size of decompressed data doesn't match expected"));
+                return Err(einval!(format!(
+                    "size of decompressed data doesn't match expected, {} vs {}, raw_buffer: {}",
+                    ret,
+                    buffer.len(),
+                    raw_buffer.len()
+                )));
             }
         } else if raw_buffer.as_ptr() != buffer.as_ptr() {
             // raw_chunk and chunk may point to the same buffer, so only copy data when needed.
@@ -385,6 +395,7 @@ pub trait BlobCache: Send + Sync {
 pub struct ChunkDecompressState<'a, 'b> {
     blob_offset: u64,
     chunk_idx: usize,
+    batch_idx: u32,
     zran_idx: u32,
     cache: &'a dyn BlobCache,
     chunks: Vec<&'b dyn BlobChunkInfo>,
@@ -402,12 +413,56 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         ChunkDecompressState {
             blob_offset,
             chunk_idx: 0,
+            batch_idx: u32::MAX,
             zran_idx: u32::MAX,
             cache,
             chunks,
             c_buf,
             d_buf: Vec::new(),
         }
+    }
+
+    fn decompress_batch(&mut self, meta: &Arc<BlobCompressionContextInfo>) -> Result<()> {
+        let ctx = meta
+            .get_batch_context(self.batch_idx)
+            .ok_or_else(|| einval!("failed to get Batch context for chunk"))?;
+        let c_offset = ctx.compressed_offset();
+        let c_size = ctx.compressed_size() as u64;
+        let d_size = ctx.uncompressed_batch_size() as u64;
+        if c_offset < self.blob_offset
+            || c_offset.checked_add(c_size).is_none()
+            || c_offset + c_size > self.blob_offset + self.c_buf.len() as u64
+            || d_size > RAFS_MAX_CHUNK_SIZE
+        {
+            let msg = format!(
+                "invalid chunk: z_offset 0x{:x}, z_size 0x{:x}, c_offset 0x{:x}, c_size 0x{:x}, d_size 0x{:x}",
+                self.blob_offset,
+                self.c_buf.len(),
+                c_offset,
+                c_size,
+                d_size
+            );
+            return Err(einval!(msg));
+        }
+
+        let c_offset = (c_offset - self.blob_offset) as usize;
+        let input = &self.c_buf[c_offset..c_offset + c_size as usize];
+        let mut output = alloc_buf(d_size as usize);
+
+        self.cache
+            .decompress_chunk_data(input, &mut output, c_size != d_size)?;
+
+        if output.len() != d_size as usize {
+            return Err(einval!(format!(
+                "decompressed data size doesn't match: {} vs {}",
+                output.len(),
+                d_size
+            )));
+        }
+
+        self.d_buf = output;
+
+        Ok(())
     }
 
     fn decompress_zran(&mut self, meta: &Arc<BlobCompressionContextInfo>) -> Result<()> {
@@ -440,6 +495,39 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         self.d_buf = output;
 
         Ok(())
+    }
+
+    fn next_batch(&mut self, chunk: &dyn BlobChunkInfo) -> Result<Vec<u8>> {
+        let meta = self
+            .cache
+            .get_blob_meta_info()?
+            .ok_or_else(|| einval!("failed to get blob meta object for Batch"))?;
+
+        // If the chunk is not a batch chunk, decompress it as normal.
+        if !meta.is_batch_chunk(chunk.id()) {
+            return self.next_buf(chunk);
+        }
+
+        let batch_idx = meta.get_batch_index(chunk.id());
+        if batch_idx != self.batch_idx {
+            self.batch_idx = batch_idx;
+            self.decompress_batch(&meta)?;
+        }
+        let offset = meta.get_uncompressed_offset_in_batch_buf(chunk.id()) as usize;
+        let end = offset + chunk.uncompressed_size() as usize;
+        if end > self.d_buf.len() {
+            return Err(einval!(format!(
+                "invalid Batch decompression status, end: {}, len: {}",
+                end,
+                self.d_buf.len()
+            )));
+        }
+
+        // Use alloc_buf here to ensure 4k alignment for later use
+        // in adjust_buffer_for_dio.
+        let mut buffer = alloc_buf(chunk.uncompressed_size() as usize);
+        buffer.copy_from_slice(&self.d_buf[offset as usize..end]);
+        Ok(buffer)
     }
 
     fn next_zran(&mut self, chunk: &dyn BlobChunkInfo) -> Result<Vec<u8>> {
@@ -513,7 +601,9 @@ impl<'a, 'b> Iterator for ChunkDecompressState<'a, 'b> {
         let cache = self.cache;
         let chunk = self.chunks[self.chunk_idx];
         self.chunk_idx += 1;
-        let res = if cache.is_zran() {
+        let res = if cache.is_batch() {
+            self.next_batch(chunk)
+        } else if cache.is_zran() {
             self.next_zran(chunk)
         } else {
             self.next_buf(chunk)

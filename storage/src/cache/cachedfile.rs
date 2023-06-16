@@ -157,6 +157,8 @@ pub(crate) struct FileCacheEntry {
     pub(crate) is_legacy_stargz: bool,
     // The blob is for an RAFS filesystem in `TARFS` mode.
     pub(crate) is_tarfs: bool,
+    // The blob contains batch chunks.
+    pub(crate) is_batch: bool,
     // The blob is based on ZRan decompression algorithm.
     pub(crate) is_zran: bool,
     // True if direct IO is enabled for the `self.file`, supported for fscache only.
@@ -404,6 +406,18 @@ impl FileCacheEntry {
                 .ok_or_else(|| einval!("failed to get ZRan context for chunk"))?;
             let blob_end = ctx.in_offset + ctx.in_len as u64;
             (blob_start, blob_end)
+        } else if self.is_batch {
+            let meta = self
+                .get_blob_meta_info()?
+                .ok_or_else(|| einval!("failed to get blob meta object"))?;
+
+            let (c_offset, _) = meta.get_compressed_info(chunks[0].id())?;
+            let blob_start = c_offset;
+
+            let (c_offset, c_size) = meta.get_compressed_info(chunks[chunks.len() - 1].id())?;
+            let blob_end = c_offset + c_size as u64;
+
+            (blob_start, blob_end)
         } else {
             let last = chunks.len() - 1;
             (chunks[0].compressed_offset(), chunks[last].compressed_end())
@@ -457,6 +471,10 @@ impl BlobCache for FileCacheEntry {
 
     fn is_legacy_stargz(&self) -> bool {
         self.is_legacy_stargz
+    }
+
+    fn is_batch(&self) -> bool {
+        self.is_batch
     }
 
     fn is_zran(&self) -> bool {
@@ -1004,14 +1022,15 @@ impl FileCacheEntry {
                 } else {
                     BlobIoTag::Internal
                 };
+
+                let (start, len) = if let Ok(Some(meta)) = self.get_blob_meta_info() {
+                    meta.get_compressed_info(chunk.id())?
+                } else {
+                    (chunk.compressed_offset(), chunk.compressed_size())
+                };
+
                 // NOTE: Only this request region can read more chunks from backend with user io.
-                state.push(
-                    RegionType::Backend,
-                    chunk.compressed_offset(),
-                    chunk.compressed_size(),
-                    tag,
-                    Some(chunk.clone()),
-                )?;
+                state.push(RegionType::Backend, start, len, tag, Some(chunk.clone()))?;
             }
         }
 
@@ -1093,7 +1112,8 @@ impl FileCacheEntry {
                         tag_set.insert(chunk.id());
                     }
                 }
-                region_hold = Region::with(region, v);
+
+                region_hold = Region::with(self, region, v)?;
                 for (idx, c) in region_hold.chunks.iter().enumerate() {
                     if tag_set.contains(&c.id()) {
                         region_hold.tags[idx] = true;
@@ -1447,16 +1467,30 @@ impl Region {
         }
     }
 
-    fn with(region: &Region, chunks: Vec<Arc<dyn BlobChunkInfo>>) -> Self {
+    fn with(
+        ctx: &FileCacheEntry,
+        region: &Region,
+        chunks: Vec<Arc<dyn BlobChunkInfo>>,
+    ) -> Result<Self> {
         assert!(!chunks.is_empty());
         let len = chunks.len();
-        let blob_address = chunks[0].compressed_offset();
-        let last = &chunks[len - 1];
-        let sz = last.compressed_offset() - blob_address;
-        assert!(sz < u32::MAX as u64);
-        let blob_len = sz as u32 + last.compressed_size();
 
-        Region {
+        let meta = ctx
+            .get_blob_meta_info()?
+            .ok_or_else(|| einval!("failed to get blob meta object"))?;
+        let (blob_address, blob_len) = if ctx.is_batch && meta.is_batch_chunk(chunks[0].id()) {
+            // Assert all chunks are in the same batch.
+            meta.get_compressed_info(chunks[0].id())?
+        } else {
+            let ba = chunks[0].compressed_offset();
+            let last = &chunks[len - 1];
+            let sz = last.compressed_offset() - ba;
+            assert!(sz < u32::MAX as u64);
+
+            (ba, sz as u32 + last.compressed_size())
+        };
+
+        Ok(Region {
             r#type: region.r#type,
             status: region.status,
             count: len as u32,
@@ -1465,7 +1499,7 @@ impl Region {
             blob_address,
             blob_len,
             seg: region.seg.clone(),
-        }
+        })
     }
 
     fn append(
